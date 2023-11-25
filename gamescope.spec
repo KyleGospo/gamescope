@@ -52,11 +52,17 @@ BuildRequires:  stb_image_resize-devel
 Requires:       libliftoff%{?_isa} >= %{libliftoff_minver}
 Requires:       xorg-x11-server-Xwayland
 Requires:       google-benchmark
+Requires:	    gamescope-libs = %{version}-%{release}
 Recommends:     mesa-dri-drivers
 Recommends:     mesa-vulkan-drivers
 
 %description
 %{name} is the micro-compositor optimized for running video games on Wayland.
+
+%package libs
+Summary:	libs for %{name}
+%description libs
+%summary
 
 %prep
 git clone --branch build https://github.com/KyleGospo/gamescope.git
@@ -68,11 +74,7 @@ cp %{SOURCE1} pkgconfig/stb.pc
 %build
 cd gamescope
 export PKG_CONFIG_PATH=pkgconfig
-%if %{__isa_bits} == 64
 %meson -Dpipewire=enabled -Denable_gamescope=true -Denable_gamescope_wsi_layer=true -Denable_openvr_support=true -Dforce_fallback_for=[]
-%else
-%meson -Dpipewire=enabled -Denable_gamescope=false -Denable_gamescope_wsi_layer=true -Denable_openvr_support=true -Dforce_fallback_for=[]
-%endif
 %meson_build
 
 %install
@@ -82,11 +84,11 @@ cd gamescope
 %files
 %license gamescope/LICENSE
 %doc gamescope/README.md
-%{_libdir}/*.so
-%{_datadir}/vulkan/implicit_layer.d/*
-%if %{__isa_bits} == 64
 %attr(0755, root, root) %caps(cap_sys_nice=eip) %{_bindir}/gamescope
-%endif
+
+%files libs
+%{_libdir}/*.so
+%{_datadir}/vulkan/implicit_layer.d/
 
 %changelog
 {{{ git_dir_changelog }}}
