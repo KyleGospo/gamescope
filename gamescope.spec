@@ -37,10 +37,11 @@ BuildRequires:  pkgconfig(wayland-protocols) >= 1.17
 BuildRequires:  pkgconfig(xkbcommon)
 BuildRequires:  pkgconfig(sdl2)
 BuildRequires:  pkgconfig(libpipewire-0.3)
-BuildRequires:  (pkgconfig(wlroots) >= 0.16.0 with pkgconfig(wlroots) < 0.17)
+BuildRequires:  (pkgconfig(wlroots) >= 0.17.0 with pkgconfig(wlroots) < 0.18.0)
 BuildRequires:  (pkgconfig(libliftoff) >= 0.4.1 with pkgconfig(libliftoff) < 0.5)
 BuildRequires:  pkgconfig(libcap)
 BuildRequires:  pkgconfig(hwdata)
+BuildRequires:  pkgconfig(xwayland)
 BuildRequires:  vkroots-devel
 BuildRequires:  /usr/bin/glslangValidator
 BuildRequires:  git
