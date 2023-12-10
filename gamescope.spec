@@ -42,6 +42,7 @@ BuildRequires:  (pkgconfig(libliftoff) >= 0.4.1 with pkgconfig(libliftoff) < 0.5
 BuildRequires:  pkgconfig(libcap)
 BuildRequires:  pkgconfig(hwdata)
 BuildRequires:  pkgconfig(xwayland)
+BuildRequires:  pkgconfig(xcursor)
 BuildRequires:  vkroots-devel
 BuildRequires:  /usr/bin/glslangValidator
 BuildRequires:  git
