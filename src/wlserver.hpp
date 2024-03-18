@@ -11,10 +11,14 @@
 #include <set>
 #include <list>
 #include <optional>
-#include <vulkan/vulkan_core.h>
 
-#include "drm.hpp"
+#include "vulkan_include.h"
+
 #include "steamcompmgr_shared.hpp"
+
+#if HAVE_DRM
+#define HAVE_SESSION 1
+#endif
 
 #define WLSERVER_BUTTON_COUNT 7
 
@@ -31,13 +35,14 @@ struct wlserver_vk_swapchain_feedback
 	VkPresentModeKHR vk_present_mode;
 	VkBool32 vk_clipped;
 
-	std::shared_ptr<wlserver_hdr_metadata> hdr_metadata_blob;
+	std::shared_ptr<gamescope::BackendBlob> hdr_metadata_blob;
 };
 
 struct ResListEntry_t {
 	struct wlr_surface *surf;
 	struct wlr_buffer *buf;
 	bool async;
+	bool fifo;
 	std::shared_ptr<wlserver_vk_swapchain_feedback> feedback;
 	std::vector<struct wl_resource*> presentation_feedbacks;
 	std::optional<uint32_t> present_id;
@@ -66,7 +71,7 @@ public:
 
 	void wayland_commit(struct wlr_surface *surf, struct wlr_buffer *buf);
 
-	std::vector<ResListEntry_t> retrieve_commits();
+	std::vector<ResListEntry_t>& retrieve_commits();
 
 	void handle_override_window_content( struct wl_client *client, struct wl_resource *resource, struct wlr_surface *surface, uint32_t x11_window );
 	void destroy_content_override( struct wlserver_x11_surface_info *x11_surface, struct wlr_surface *surf);
@@ -109,6 +114,8 @@ struct wlserver_t {
 
 		// Used to simulate key events and set the keymap
 		struct wlr_keyboard *virtual_keyboard_device;
+
+		struct wlr_device *device;
 
 		std::vector<std::unique_ptr<gamescope_xwayland_server_t>> xwayland_servers;
 	} wlr;
@@ -185,6 +192,7 @@ void xwayland_surface_commit(struct wlr_surface *wlr_surface);
 
 bool wlsession_init( void );
 int wlsession_open_kms( const char *device_name );
+void wlsession_close_kms();
 
 bool wlserver_init( void );
 
@@ -269,3 +277,8 @@ void wlserver_past_present_timing( struct wlr_surface *surface, uint32_t present
 void wlserver_refresh_cycle( struct wlr_surface *surface, uint64_t refresh_cycle );
 
 void wlserver_force_shutdown();
+
+void wlserver_send_gamescope_control( wl_resource *control );
+
+bool wlsession_active();
+

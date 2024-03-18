@@ -1,7 +1,6 @@
 #version 450
 
 #extension GL_GOOGLE_include_directive : require
-#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
 #extension GL_EXT_scalar_block_layout : require
 
 #include "descriptor_set.h"
@@ -17,7 +16,7 @@ layout(
 // UVUVUVUVUVUVUVU...
 
 const uint u_frameId = 0;
-const uint8_t u_shaderFilter[VKR_MAX_LAYERS] = { uint8_t(filter_linear_emulated), uint8_t(0), uint8_t(0), uint8_t(0), uint8_t(0), uint8_t(0) };
+const uint u_shaderFilter = filter_linear_emulated;
 const float u_linearToNits = 400.0f;
 const float u_nitsToLinear = 1.0f / 100.0f;
 const float u_itmSdrNits = 100.f;
@@ -49,12 +48,12 @@ void main() {
 
   // todo: fix
   if (all(lessThan(thread_id.xy, ivec2(u_halfExtent.x, u_halfExtent.y)))) {
-    ivec2 offset_table[4] = {
-      ivec2(0, 0), ivec2(1, 0), ivec2(0, 1), ivec2(1, 1),
+    vec2 offset_table[4] = {
+      vec2(0, 0), vec2(1, 0), vec2(0, 1), vec2(1, 1),
     };
 
     ivec2 chroma_uv = thread_id.xy;
-    ivec2 luma_uv = thread_id.xy * 2;
+    vec2 luma_uv = vec2(thread_id.xy * 2) + vec2(0.5f, 0.5f);
 
     vec3 color[4] = {
       sampleLayer(0, vec2(luma_uv.x + offset_table[0].x, luma_uv.y + offset_table[0].y)).rgb,
@@ -69,7 +68,7 @@ void main() {
 
     for (int i = 0; i < 4; i++) {
       float y = applyColorMatrix(color[i], u_outputCTM).x;
-      imageStore(dst_luma, luma_uv + offset_table[i], vec4(y, 0.0f, 0.0f, 1.0f));
+      imageStore(dst_luma, ivec2(luma_uv + offset_table[i]), vec4(y, 0.0f, 0.0f, 1.0f));
     }
   }
 }

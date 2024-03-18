@@ -18,10 +18,10 @@ struct mangoapp_msg_v1 {
     struct mangoapp_msg_header hdr;
 
     uint32_t pid;
-    uint64_t visible_frametime_ns;
+    uint64_t app_frametime_ns;
     uint8_t fsrUpscale;
     uint8_t fsrSharpness;
-    uint64_t app_frametime_ns;
+    uint64_t visible_frametime_ns;
     uint64_t latency_ns;
     uint32_t outputWidth;
     uint32_t outputHeight;
@@ -51,4 +51,27 @@ void mangoapp_update( uint64_t visible_frametime, uint64_t app_frametime_ns, uin
     mangoapp_msg_v1.outputWidth = g_nOutputWidth;
     mangoapp_msg_v1.outputHeight = g_nOutputHeight;
     msgsnd(msgid, &mangoapp_msg_v1, sizeof(mangoapp_msg_v1) - sizeof(mangoapp_msg_v1.hdr.msg_type), IPC_NOWAIT);
+}
+
+extern uint64_t g_uCurrentBasePlaneCommitID;
+extern bool g_bCurrentBasePlaneIsFifo;
+void mangoapp_output_update( uint64_t vblanktime )
+{
+    if ( !g_bCurrentBasePlaneIsFifo )
+    {
+        return;
+    }
+
+	static uint64_t s_uLastBasePlaneCommitID = 0;
+	if ( s_uLastBasePlaneCommitID != g_uCurrentBasePlaneCommitID )
+	{
+		static uint64_t s_uLastBasePlaneUpdateVBlankTime = vblanktime;
+        uint64_t last_frametime = s_uLastBasePlaneUpdateVBlankTime;
+        uint64_t frametime = vblanktime - last_frametime;
+		s_uLastBasePlaneUpdateVBlankTime = vblanktime;
+		s_uLastBasePlaneCommitID = g_uCurrentBasePlaneCommitID;
+        if ( last_frametime > vblanktime )
+            return;
+		mangoapp_update( frametime, uint64_t(~0ull), uint64_t(~0ull) );
+	}
 }

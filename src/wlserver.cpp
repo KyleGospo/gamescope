@@ -14,14 +14,12 @@
 #include <X11/extensions/XTest.h>
 #include <xkbcommon/xkbcommon.h>
 
-#include <wayland-server-core.h>
-
-extern "C" {
-#define static
-#define class class_
+#include "wlr_begin.hpp"
 #include <wlr/backend.h>
 #include <wlr/backend/headless.h>
+#if HAVE_DRM
 #include <wlr/backend/libinput.h>
+#endif
 #include <wlr/backend/multi.h>
 #include <wlr/interfaces/wlr_keyboard.h>
 #include <wlr/render/wlr_renderer.h>
@@ -33,25 +31,23 @@ extern "C" {
 #include <wlr/util/log.h>
 #include <wlr/xwayland/server.h>
 #include <wlr/types/wlr_xdg_shell.h>
-#undef static
-#undef class
-}
+#include "wlr_end.hpp"
 
 #include "gamescope-xwayland-protocol.h"
 #include "gamescope-pipewire-protocol.h"
 #include "gamescope-control-protocol.h"
 #include "gamescope-swapchain-protocol.h"
 #include "gamescope-tearing-control-unstable-v1-protocol.h"
+#include "gamescope-commit-queue-v1-protocol.h"
 #include "presentation-time-protocol.h"
 
 #include "wlserver.hpp"
-#include "drm.hpp"
+#include "hdmi.h"
 #include "main.hpp"
 #include "steamcompmgr.hpp"
 #include "log.hpp"
 #include "ime.hpp"
 #include "xwayland_ctx.hpp"
-#include "sdlwindow.hpp"
 
 #if HAVE_PIPEWIRE
 #include "pipewire.hpp"
@@ -86,13 +82,17 @@ static struct wl_list pending_surfaces = {0};
 
 static void wlserver_x11_surface_info_set_wlr( struct wlserver_x11_surface_info *surf, struct wlr_surface *wlr_surf, bool override );
 wlserver_wl_surface_info *get_wl_surface_info(struct wlr_surface *wlr_surf);
+static enum gamescope_commit_queue_v1_queue_mode gamescope_commit_queue_v1_get_surface_mode(struct wlr_surface *surface);
 
-std::vector<ResListEntry_t> gamescope_xwayland_server_t::retrieve_commits()
+std::vector<ResListEntry_t>& gamescope_xwayland_server_t::retrieve_commits()
 {
-	std::vector<ResListEntry_t> commits;
+	static std::vector<ResListEntry_t> commits;
+	commits.clear();
+	commits.reserve(16);
+
 	{
 		std::lock_guard<std::mutex> lock( wayland_commit_lock );
-		commits = std::move(wayland_commit_queue);
+		commits.swap(wayland_commit_queue);
 	}
 	return commits;
 }
@@ -104,10 +104,13 @@ void gamescope_xwayland_server_t::wayland_commit(struct wlr_surface *surf, struc
 
 		auto wl_surf = get_wl_surface_info( surf );
 
+		auto queue_mode = gamescope_commit_queue_v1_get_surface_mode(surf);
+
 		ResListEntry_t newEntry = {
 			.surf = surf,
 			.buf = buf,
 			.async = wlserver_surface_is_async(surf),
+			.fifo = queue_mode == GAMESCOPE_COMMIT_QUEUE_V1_QUEUE_MODE_FIFO,
 			.feedback = wlserver_surface_swapchain_feedback(surf),
 			.presentation_feedbacks = std::move(wl_surf->pending_presentation_feedbacks),
 			.present_id = wl_surf->present_id,
@@ -116,6 +119,7 @@ void gamescope_xwayland_server_t::wayland_commit(struct wlr_surface *surf, struc
 		wl_surf->present_id = std::nullopt;
 		wl_surf->desired_present_time = 0;
 		wl_surf->pending_presentation_feedbacks.clear();
+
 		wayland_commit_queue.push_back( newEntry );
 	}
 
@@ -225,11 +229,13 @@ static void wlserver_handle_key(struct wl_listener *listener, void *data)
 	xkb_keycode_t keycode = event->keycode + 8;
 	xkb_keysym_t keysym = xkb_state_key_get_one_sym(keyboard->wlr->xkb_state, keycode);
 
+#if HAVE_SESSION
 	if (wlserver.wlr.session && event->state == WL_KEYBOARD_KEY_STATE_PRESSED && keysym >= XKB_KEY_XF86Switch_VT_1 && keysym <= XKB_KEY_XF86Switch_VT_12) {
 		unsigned vt = keysym - XKB_KEY_XF86Switch_VT_1 + 1;
 		wlr_session_change_vt(wlserver.wlr.session, vt);
 		return;
 	}
+#endif
 
 	bool forbidden_key =
 		keysym == XKB_KEY_XF86AudioLowerVolume ||
@@ -261,6 +267,9 @@ static void wlserver_perform_rel_pointer_motion(double unaccel_dx, double unacce
 	auto server = steamcompmgr_get_focused_server();
 	if ( server != NULL )
 	{
+		unaccel_dx *= g_mouseSensitivity;
+		unaccel_dy *= g_mouseSensitivity;
+
 		server->ctx->accum_x += unaccel_dx;
 		server->ctx->accum_y += unaccel_dy;
 
@@ -533,6 +542,9 @@ void gamescope_xwayland_server_t::destroy_content_override( struct wlserver_x11_
 	if (iter == content_overrides.end())
 		return;
 
+	if ( x11_surface->override_surface == surf )
+		x11_surface->override_surface = nullptr;
+
 	struct wlserver_content_override *co = iter->second;
 	if (co->surface == surf)
 		destroy_content_override(iter->second);
@@ -757,8 +769,7 @@ static void gamescope_swapchain_set_hdr_metadata( struct wl_client *client, stru
 		infoframe.max_cll = max_cll;
 		infoframe.max_fall = max_fall;
 
-		wl_info->swapchain_feedback->hdr_metadata_blob =
-			drm_create_hdr_metadata_blob( &g_DRM, &metadata );
+		wl_info->swapchain_feedback->hdr_metadata_blob = GetBackend()->CreateBackendBlob( metadata );
 	}
 }
 
@@ -863,11 +874,21 @@ static void create_gamescope_pipewire( void )
 
 static void gamescope_control_set_app_target_refresh_cycle( struct wl_client *client, struct wl_resource *resource, uint32_t fps, uint32_t flags )
 {
-	auto display_type = DRM_SCREEN_TYPE_EXTERNAL;
+	auto display_type = gamescope::GAMESCOPE_SCREEN_TYPE_EXTERNAL;
 	if ( flags & GAMESCOPE_CONTROL_TARGET_REFRESH_CYCLE_FLAG_INTERNAL_DISPLAY )
-		display_type = DRM_SCREEN_TYPE_INTERNAL;
+		display_type = gamescope::GAMESCOPE_SCREEN_TYPE_INTERNAL;
 
 	steamcompmgr_set_app_refresh_cycle_override( display_type, fps );
+}
+
+static void gamescope_control_take_screenshot( struct wl_client *client, struct wl_resource *resource, const char *path, uint32_t type, uint32_t flags )
+{
+	gamescope::CScreenshotManager::Get().TakeScreenshot( gamescope::GamescopeScreenshotInfo
+	{
+		.szScreenshotPath = path,
+		.eScreenshotType  = (gamescope_control_screenshot_type)type,
+		.uScreenshotFlags = flags,
+	} );
 }
 
 static void gamescope_control_handle_destroy( struct wl_client *client, struct wl_resource *resource )
@@ -878,7 +899,53 @@ static void gamescope_control_handle_destroy( struct wl_client *client, struct w
 static const struct gamescope_control_interface gamescope_control_impl = {
 	.destroy = gamescope_control_handle_destroy,
 	.set_app_target_refresh_cycle = gamescope_control_set_app_target_refresh_cycle,
+	.take_screenshot = gamescope_control_take_screenshot,
 };
+
+static uint32_t get_conn_display_info_flags()
+{
+	gamescope::IBackendConnector *pConn = GetBackend()->GetCurrentConnector();
+
+	if ( !pConn )
+		return 0;
+
+	uint32_t flags = 0;
+	if ( pConn->GetScreenType() == gamescope::GAMESCOPE_SCREEN_TYPE_INTERNAL )
+		flags |= GAMESCOPE_CONTROL_DISPLAY_FLAG_INTERNAL_DISPLAY;
+	if ( pConn->SupportsVRR() )
+		flags |= GAMESCOPE_CONTROL_DISPLAY_FLAG_SUPPORTS_VRR;
+	if ( pConn->GetHDRInfo().bExposeHDRSupport )
+		flags |= GAMESCOPE_CONTROL_DISPLAY_FLAG_SUPPORTS_HDR;
+
+	return flags;
+}
+
+void wlserver_send_gamescope_control( wl_resource *control )
+{
+	assert( wlserver_is_lock_held() );
+
+	gamescope::IBackendConnector *pConn = GetBackend()->GetCurrentConnector();
+	if ( !pConn )
+		return;
+
+	uint32_t flags = get_conn_display_info_flags();
+
+	struct wl_array display_rates;
+	wl_array_init(&display_rates);
+	if ( pConn->GetValidDynamicRefreshRates().size() )
+	{
+		size_t size = pConn->GetValidDynamicRefreshRates().size() * sizeof(uint32_t);
+		uint32_t *ptr = (uint32_t *)wl_array_add( &display_rates, size );
+		memcpy( ptr, pConn->GetValidDynamicRefreshRates().data(), size );
+	}
+	else if ( g_nOutputRefresh > 0 )
+	{
+		uint32_t *ptr = (uint32_t *)wl_array_add( &display_rates, sizeof(uint32_t) );
+		*ptr = (uint32_t)g_nOutputRefresh;
+	}
+	gamescope_control_send_active_display_info( control, pConn->GetName(), pConn->GetMake(), pConn->GetModel(), flags, &display_rates );
+	wl_array_release(&display_rates);
+}
 
 static void gamescope_control_bind( struct wl_client *client, void *data, uint32_t version, uint32_t id )
 {
@@ -893,19 +960,17 @@ static void gamescope_control_bind( struct wl_client *client, void *data, uint32
 	gamescope_control_send_feature_support( resource, GAMESCOPE_CONTROL_FEATURE_RESHADE_SHADERS, 1, 0 );
 	gamescope_control_send_feature_support( resource, GAMESCOPE_CONTROL_FEATURE_DISPLAY_INFO, 1, 0 );
 	gamescope_control_send_feature_support( resource, GAMESCOPE_CONTROL_FEATURE_PIXEL_FILTER, 1, 0 );
+	gamescope_control_send_feature_support( resource, GAMESCOPE_CONTROL_FEATURE_MURA_CORRECTION, 1, 0 );
 	gamescope_control_send_feature_support( resource, GAMESCOPE_CONTROL_FEATURE_DONE, 0, 0 );
 
-	if ( !BIsNested() )
-	{
-		drm_send_gamescope_control( resource, &g_DRM );
-	}
+	wlserver_send_gamescope_control( resource );
 
 	wlserver.gamescope_controls.push_back(resource);
 }
 
 static void create_gamescope_control( void )
 {
-	uint32_t version = 2;
+	uint32_t version = 3;
 	wl_global_create( wlserver.display, &gamescope_control_interface, version, NULL, gamescope_control_bind );
 }
 
@@ -960,6 +1025,147 @@ static void create_gamescope_tearing( void )
 }
 
 
+struct gamescope_commit_queue_v1 {
+	struct wl_resource *resource;
+	struct wlr_surface *surface;
+
+	struct {
+		enum gamescope_commit_queue_v1_queue_mode mode;
+	} current, pending;
+
+	struct wlr_addon surface_addon;
+	struct wl_listener surface_commit;
+};
+
+extern const struct gamescope_commit_queue_v1_interface queue_impl;
+
+// Returns NULL if inert
+static struct gamescope_commit_queue_v1 *queue_from_resource(struct wl_resource *resource) {
+	assert(wl_resource_instance_of(resource,
+		&gamescope_commit_queue_v1_interface, &queue_impl));
+	return (struct gamescope_commit_queue_v1 *) wl_resource_get_user_data(resource);
+}
+
+static void resource_handle_destroy(struct wl_client *client, struct wl_resource *resource) {
+	wl_resource_destroy(resource);
+}
+
+static void queue_destroy(struct gamescope_commit_queue_v1 *queue) {
+	if (queue == NULL) {
+		return;
+	}
+	wl_list_remove(&queue->surface_commit.link);
+	wlr_addon_finish(&queue->surface_addon);
+	wl_resource_set_user_data(queue->resource, NULL); // make inert
+	free(queue);
+}
+
+static void surface_addon_handle_destroy(struct wlr_addon *addon) {
+	struct gamescope_commit_queue_v1 *queue = wl_container_of(addon, queue, surface_addon);
+	queue_destroy(queue);
+}
+
+static const struct wlr_addon_interface surface_addon_impl = {
+	.name = "gamescope_commit_queue_v1",
+	.destroy = surface_addon_handle_destroy,
+};
+
+static void queue_handle_set_queue_mode(struct wl_client *client,
+		struct wl_resource *resource, uint32_t mode) {
+	struct gamescope_commit_queue_v1 *queue = queue_from_resource(resource);
+
+	if (mode > GAMESCOPE_COMMIT_QUEUE_V1_QUEUE_MODE_FIFO) {
+		wl_resource_post_error(resource, GAMESCOPE_COMMIT_QUEUE_V1_ERROR_INVALID_QUEUE_MODE,
+			"Invalid queue mode");
+		return;
+	}
+
+	queue->pending.mode = (enum gamescope_commit_queue_v1_queue_mode) mode;
+}
+
+const struct gamescope_commit_queue_v1_interface queue_impl = {
+	.set_queue_mode = queue_handle_set_queue_mode,
+	.destroy = resource_handle_destroy,
+};
+
+static void queue_handle_surface_commit(struct wl_listener *listener, void *data) {
+	struct gamescope_commit_queue_v1 *queue = wl_container_of(listener, queue, surface_commit);
+	queue->current = queue->pending;
+}
+
+static void queue_handle_resource_destroy(struct wl_resource *resource) {
+	struct gamescope_commit_queue_v1 *queue = queue_from_resource(resource);
+	queue_destroy(queue);
+}
+
+static void manager_handle_get_queue_controller(struct wl_client *client,
+		struct wl_resource *manager_resource, uint32_t id,
+		struct wl_resource *surface_resource) {
+	struct wlr_surface *surface = wlr_surface_from_resource(surface_resource);
+
+	if (wlr_addon_find(&surface->addons, NULL, &surface_addon_impl) != NULL) {
+		wl_resource_post_error(manager_resource,
+			GAMESCOPE_COMMIT_QUEUE_MANAGER_V1_ERROR_QUEUE_CONTROLLER_ALREADY_EXISTS,
+			"A gamescope_commit_queue_v1 object already exists for this surface");
+		return;
+	}
+
+	struct gamescope_commit_queue_v1 *queue = (struct gamescope_commit_queue_v1 *) calloc(1, sizeof(*queue));
+	if (queue == NULL) {
+		wl_resource_post_no_memory(manager_resource);
+		return;
+	}
+
+	queue->surface = surface;
+
+	uint32_t version = wl_resource_get_version(manager_resource);
+	queue->resource = wl_resource_create(client,
+		&gamescope_commit_queue_v1_interface, version, id);
+	if (queue->resource == NULL) {
+		free(queue);
+		wl_resource_post_no_memory(manager_resource);
+		return;
+	}
+	wl_resource_set_implementation(queue->resource,
+		&queue_impl, queue, queue_handle_resource_destroy);
+
+	wlr_addon_init(&queue->surface_addon, &surface->addons, NULL, &surface_addon_impl);
+
+	queue->surface_commit.notify = queue_handle_surface_commit;
+	wl_signal_add(&surface->events.commit, &queue->surface_commit);
+}
+
+static const struct gamescope_commit_queue_manager_v1_interface manager_impl = {
+	.destroy = resource_handle_destroy,
+	.get_queue_controller = manager_handle_get_queue_controller,
+};
+
+static void commit_queue_manager_bind(struct wl_client *client, void *data,
+		uint32_t version, uint32_t id) {
+	struct wl_resource *resource = wl_resource_create(client,
+		&gamescope_commit_queue_manager_v1_interface, version, id);
+	if (resource == NULL) {
+		wl_client_post_no_memory(client);
+		return;
+	}
+	wl_resource_set_implementation(resource, &manager_impl, NULL, NULL);
+}
+
+static void commit_queue_manager_v1_create(struct wl_display *display) {
+	wl_global_create(display, &gamescope_commit_queue_manager_v1_interface, 1, NULL, commit_queue_manager_bind);
+}
+
+static enum gamescope_commit_queue_v1_queue_mode gamescope_commit_queue_v1_get_surface_mode(struct wlr_surface *surface) {
+	struct wlr_addon *addon =
+		wlr_addon_find(&surface->addons, NULL, &surface_addon_impl);
+	if (addon == NULL) {
+		return GAMESCOPE_COMMIT_QUEUE_V1_QUEUE_MODE_MAILBOX;
+	}
+	struct gamescope_commit_queue_v1 *queue = wl_container_of(addon, queue, surface_addon);
+	return queue->current.mode;
+}
+
+
 ////////////////////////
 // presentation-time
 ////////////////////////
@@ -1005,6 +1211,9 @@ void wlserver_presentation_feedback_presented( struct wlr_surface *surface, std:
 {
 	wlserver_wl_surface_info *wl_surface_info = get_wl_surface_info(surface);
 
+	if ( !wl_surface_info )
+		return;
+
 	uint32_t flags = 0;
 
 	// Don't know when we want to send this.
@@ -1048,6 +1257,9 @@ void wlserver_presentation_feedback_discard( struct wlr_surface *surface, std::v
 {
 	wlserver_wl_surface_info *wl_surface_info = get_wl_surface_info(surface);
 
+	if ( !wl_surface_info )
+		return;
+
 	wl_surface_info->sequence++;
 
 	for (auto& feedback : presentation_feedbacks)
@@ -1063,6 +1275,9 @@ void wlserver_presentation_feedback_discard( struct wlr_surface *surface, std::v
 void wlserver_past_present_timing( struct wlr_surface *surface, uint32_t present_id, uint64_t desired_present_time, uint64_t actual_present_time, uint64_t earliest_present_time, uint64_t present_margin )
 {
 	wlserver_wl_surface_info *wl_info = get_wl_surface_info( surface );
+	if ( !wl_info )
+		return;
+
 	gamescope_swapchain_send_past_present_timing(
 		wl_info->gamescope_swapchain,
 		present_id,
@@ -1079,6 +1294,9 @@ void wlserver_past_present_timing( struct wlr_surface *surface, uint32_t present
 void wlserver_refresh_cycle( struct wlr_surface *surface, uint64_t refresh_cycle )
 {
 	wlserver_wl_surface_info *wl_info = get_wl_surface_info( surface );
+	if ( !wl_info )
+		return;
+
 	gamescope_swapchain_send_refresh_cycle(
 		wl_info->gamescope_swapchain,
 		refresh_cycle >> 32,
@@ -1087,15 +1305,19 @@ void wlserver_refresh_cycle( struct wlr_surface *surface, uint64_t refresh_cycle
 
 ///////////////////////
 
+#if HAVE_SESSION
+bool wlsession_active()
+{
+	return wlserver.wlr.session->active;
+}
+
 static void handle_session_active( struct wl_listener *listener, void *data )
 {
-	if (wlserver.wlr.session->active) {
-		g_DRM.out_of_date = 1;
-		g_DRM.needs_modeset = 1;
-	}
-	g_DRM.paused = !wlserver.wlr.session->active;
-	wl_log.infof( "Session %s", g_DRM.paused ? "paused" : "resumed" );
+	if (wlserver.wlr.session->active)
+		GetBackend()->DirtyState( true, true );
+	wl_log.infof( "Session %s", wlserver.wlr.session->active ? "resumed" : "paused" );
 }
+#endif
 
 static void handle_wlr_log(enum wlr_log_importance importance, const char *fmt, va_list args)
 {
@@ -1174,7 +1396,8 @@ bool wlsession_init( void ) {
 	};
 	wlserver_set_output_info( &output_info );
 
-	if ( BIsNested() )
+#if HAVE_SESSION
+	if ( !GetBackend()->IsSessionBased() )
 		return true;
 
 	wlserver.wlr.session = wlr_session_create( wlserver.display );
@@ -1186,35 +1409,31 @@ bool wlsession_init( void ) {
 
 	wlserver.session_active.notify = handle_session_active;
 	wl_signal_add( &wlserver.wlr.session->events.active, &wlserver.session_active );
+#endif
 
 	return true;
 }
 
+#if HAVE_SESSION
+
 static void kms_device_handle_change( struct wl_listener *listener, void *data )
 {
-	g_DRM.out_of_date = 1;
+	GetBackend()->DirtyState();
 	wl_log.infof( "Got change event for KMS device" );
 
 	nudge_steamcompmgr();
 }
 
 int wlsession_open_kms( const char *device_name ) {
-	struct wlr_device *device = nullptr;
 	if ( device_name != nullptr )
 	{
-		device = wlr_session_open_file( wlserver.wlr.session, device_name );
-		if ( device == nullptr )
+		wlserver.wlr.device = wlr_session_open_file( wlserver.wlr.session, device_name );
+		if ( wlserver.wlr.device == nullptr )
 			return -1;
-		if ( !drmIsKMS( device->fd ) )
-		{
-			wl_log.errorf( "'%s' is not a KMS device", device_name );
-			wlr_session_close_file( wlserver.wlr.session, device );
-			return -1;
-		}
 	}
 	else
 	{
-		ssize_t n = wlr_session_find_gpus( wlserver.wlr.session, 1, &device );
+		ssize_t n = wlr_session_find_gpus( wlserver.wlr.session, 1, &wlserver.wlr.device );
 		if ( n < 0 )
 		{
 			wl_log.errorf( "Failed to list GPUs" );
@@ -1229,10 +1448,17 @@ int wlsession_open_kms( const char *device_name ) {
 
 	struct wl_listener *listener = new wl_listener();
 	listener->notify = kms_device_handle_change;
-	wl_signal_add( &device->events.change, listener );
+	wl_signal_add( &wlserver.wlr.device->events.change, listener );
 
-	return device->fd;
+	return wlserver.wlr.device->fd;
 }
+
+void wlsession_close_kms()
+{
+	wlr_session_close_file( wlserver.wlr.session, wlserver.wlr.device );
+}
+
+#endif
 
 gamescope_xwayland_server_t::gamescope_xwayland_server_t(wl_display *display)
 {
@@ -1367,6 +1593,7 @@ void xdg_surface_new(struct wl_listener *listener, void *data)
 		wlserver.xdg_wins.emplace_back(window);
 	}
 
+	window->seq = ++g_lastWinSeq;
 	window->type = steamcompmgr_win_type_t::XDG;
 	window->_window_types.emplace<steamcompmgr_xdg_win_t>();
 
@@ -1407,8 +1634,6 @@ void xdg_surface_new(struct wl_listener *listener, void *data)
 bool wlserver_init( void ) {
 	assert( wlserver.display != nullptr );
 
-	bool bIsDRM = !BIsNested();
-
 	wl_list_init(&pending_surfaces);
 
 	wlserver.event_loop = wl_display_get_event_loop(wlserver.display);
@@ -1420,14 +1645,16 @@ bool wlserver_init( void ) {
 
 	wl_signal_add( &wlserver.wlr.multi_backend->events.new_input, &new_input_listener );
 
-	if ( bIsDRM == True )
+	if ( GetBackend()->IsSessionBased() )
 	{
+#if HAVE_DRM
 		wlserver.wlr.libinput_backend = wlr_libinput_backend_create( wlserver.display, wlserver.wlr.session );
 		if ( wlserver.wlr.libinput_backend == NULL)
 		{
 			return false;
 		}
 		wlr_multi_backend_add( wlserver.wlr.multi_backend, wlserver.wlr.libinput_backend );
+#endif
 	}
 
 	// Create a stub wlr_keyboard only used to set the keymap
@@ -1460,6 +1687,8 @@ bool wlserver_init( void ) {
 	create_gamescope_tearing();
 
 	create_presentation_time();
+
+	commit_queue_manager_v1_create(wlserver.display);
 
 	wlserver.xdg_shell = wlr_xdg_shell_create(wlserver.display, 3);
 	if (!wlserver.xdg_shell)
@@ -1693,15 +1922,7 @@ void wlserver_mousefocus( struct wlr_surface *wlrsurface, int x /* = 0 */, int y
 
 void wlserver_mousemotion( int x, int y, uint32_t time )
 {
-	assert( wlserver_is_lock_held() );
-
-	// TODO: Pick the xwayland_server with active focus
-	auto server = steamcompmgr_get_focused_server();
-	if ( server != NULL )
-	{
-		XTestFakeRelativeMotionEvent( server->get_xdisplay(), x, y, CurrentTime );
-		XFlush( server->get_xdisplay() );
-	}
+	wlserver_perform_rel_pointer_motion( x, y );
 }
 
 void wlserver_mousewarp( int x, int y, uint32_t time )
@@ -1768,11 +1989,15 @@ bool wlserver_surface_is_async( struct wlr_surface *surf )
 	return wl_surf->presentation_hint != 0;
 }
 
+static std::shared_ptr<wlserver_vk_swapchain_feedback> s_NullFeedback;
+
 const std::shared_ptr<wlserver_vk_swapchain_feedback>& wlserver_surface_swapchain_feedback( struct wlr_surface *surf )
 {
 	assert( wlserver_is_lock_held() );
 
 	auto wl_surf = get_wl_surface_info( surf );
+	if ( !wl_surf )
+		return s_NullFeedback;
 
 	return wl_surf->swapchain_feedback;
 }
@@ -1784,22 +2009,23 @@ static void apply_touchscreen_orientation(double *x, double *y )
 	double ty = 0;
 
 	// Use internal screen always for orientation purposes.
-	switch ( g_drmEffectiveOrientation[DRM_SCREEN_TYPE_INTERNAL] )
+	switch ( GetBackend()->GetConnector( gamescope::GAMESCOPE_SCREEN_TYPE_INTERNAL )->GetCurrentOrientation() )
 	{
 		default:
-		case DRM_MODE_ROTATE_0:
+		case GAMESCOPE_PANEL_ORIENTATION_AUTO:
+		case GAMESCOPE_PANEL_ORIENTATION_0:
 			tx = *x;
 			ty = *y;
 			break;
-		case DRM_MODE_ROTATE_90:
+		case GAMESCOPE_PANEL_ORIENTATION_90:
 			tx = 1.0 - *y;
 			ty = *x;
 			break;
-		case DRM_MODE_ROTATE_180:
+		case GAMESCOPE_PANEL_ORIENTATION_180:
 			tx = 1.0 - *x;
 			ty = 1.0 - *y;
 			break;
-		case DRM_MODE_ROTATE_270:
+		case GAMESCOPE_PANEL_ORIENTATION_270:
 			tx = *y;
 			ty = 1.0 - *x;
 			break;
@@ -1813,12 +2039,12 @@ bool g_bTrackpadTouchExternalDisplay = false;
 
 int get_effective_touch_mode()
 {
-	if (!BIsNested() && g_bTrackpadTouchExternalDisplay)
-	{
-		drm_screen_type screenType = drm_get_screen_type(&g_DRM);
-		if ( screenType == DRM_SCREEN_TYPE_EXTERNAL && g_nTouchClickMode == WLSERVER_TOUCH_CLICK_PASSTHROUGH )
-			return WLSERVER_TOUCH_CLICK_TRACKPAD;
-	}
+	if ( !GetBackend() || !GetBackend()->GetCurrentConnector() )
+		return g_nTouchClickMode;
+
+	gamescope::GamescopeScreenType screenType = GetBackend()->GetCurrentConnector()->GetScreenType();
+	if ( screenType == gamescope::GAMESCOPE_SCREEN_TYPE_EXTERNAL && g_nTouchClickMode == WLSERVER_TOUCH_CLICK_PASSTHROUGH )
+		return WLSERVER_TOUCH_CLICK_TRACKPAD;
 
 	return g_nTouchClickMode;
 }
